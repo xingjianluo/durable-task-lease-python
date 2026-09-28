@@ -8,10 +8,12 @@ from __future__ import annotations
 
 import sqlite3
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # 新增列的顺序即从“无版本旧库”升级时需要补齐的列。
 # (列名, 列定义) —— 默认值保证旧数据可读且语义自洽。
+# 注意：v3 新增的 lease_token 对历史 RUNNING 行为 NULL，
+# 这正是“租约信息异常需要恢复”的判定信号，不能用伪值补齐。
 _COLUMN_MIGRATIONS: list[tuple[str, str]] = [
     ("idempotency_key", "TEXT NOT NULL DEFAULT ''"),
     ("payload", "TEXT NOT NULL DEFAULT '{}'"),
@@ -25,6 +27,7 @@ _COLUMN_MIGRATIONS: list[tuple[str, str]] = [
     ("result", "TEXT"),
     ("created_at", "REAL NOT NULL DEFAULT 0.0"),
     ("updated_at", "REAL NOT NULL DEFAULT 0.0"),
+    ("lease_token", "TEXT"),
 ]
 
 _CREATE_TASKS = """
@@ -42,13 +45,19 @@ CREATE TABLE IF NOT EXISTS tasks (
     last_error TEXT,
     result TEXT,
     created_at REAL NOT NULL,
-    updated_at REAL NOT NULL
+    updated_at REAL NOT NULL,
+    lease_token TEXT
 )
 """
 
 _CREATE_KEY_INDEX = (
     "CREATE UNIQUE INDEX IF NOT EXISTS ux_tasks_idempotency_key "
     "ON tasks(idempotency_key) WHERE idempotency_key <> ''"
+)
+
+_CREATE_STATUS_INDEX = (
+    "CREATE INDEX IF NOT EXISTS ix_tasks_status_updated "
+    "ON tasks(status, updated_at)"
 )
 
 _CREATE_EVENTS = """
@@ -64,6 +73,39 @@ CREATE TABLE IF NOT EXISTS task_events (
     created_at REAL NOT NULL
 )
 """
+
+_CREATE_EVENT_INDEX = (
+    "CREATE INDEX IF NOT EXISTS ix_task_events_task_time "
+    "ON task_events(task_id, created_at, id)"
+)
+
+# 归档表：终态任务原样迁入（含 result/last_error 等执行产出），
+# 另记 archived_at。与主表同列布局，保证“归档后仍能读到最终状态和产出”。
+_CREATE_ARCHIVE = """
+CREATE TABLE IF NOT EXISTS tasks_archive (
+    id TEXT PRIMARY KEY,
+    idempotency_key TEXT NOT NULL,
+    payload TEXT NOT NULL DEFAULT '{}',
+    status TEXT NOT NULL,
+    attempt INTEGER NOT NULL DEFAULT 0,
+    max_attempts INTEGER NOT NULL DEFAULT 1,
+    version INTEGER NOT NULL DEFAULT 0,
+    lease_owner TEXT,
+    lease_expires_at REAL,
+    available_at REAL NOT NULL DEFAULT 0.0,
+    last_error TEXT,
+    result TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    lease_token TEXT,
+    archived_at REAL NOT NULL
+)
+"""
+
+_CREATE_ARCHIVE_KEY_INDEX = (
+    "CREATE UNIQUE INDEX IF NOT EXISTS ux_archive_idempotency_key "
+    "ON tasks_archive(idempotency_key) WHERE idempotency_key <> ''"
+)
 
 
 def _column_names(conn: sqlite3.Connection, table: str) -> set[str]:
@@ -86,7 +128,11 @@ def initialize(conn: sqlite3.Connection) -> int:
         # 全新数据库：直接建立最新结构。
         conn.execute(_CREATE_TASKS)
         conn.execute(_CREATE_KEY_INDEX)
+        conn.execute(_CREATE_STATUS_INDEX)
         conn.execute(_CREATE_EVENTS)
+        conn.execute(_CREATE_EVENT_INDEX)
+        conn.execute(_CREATE_ARCHIVE)
+        conn.execute(_CREATE_ARCHIVE_KEY_INDEX)
         conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
         conn.commit()
         return SCHEMA_VERSION
@@ -98,7 +144,11 @@ def initialize(conn: sqlite3.Connection) -> int:
             conn.execute(f"ALTER TABLE tasks ADD COLUMN {name} {ddl}")
 
     conn.execute(_CREATE_KEY_INDEX)
+    conn.execute(_CREATE_STATUS_INDEX)
     conn.execute(_CREATE_EVENTS)
+    conn.execute(_CREATE_EVENT_INDEX)
+    conn.execute(_CREATE_ARCHIVE)
+    conn.execute(_CREATE_ARCHIVE_KEY_INDEX)
     conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
     conn.commit()
     return SCHEMA_VERSION
