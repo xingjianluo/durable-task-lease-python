@@ -33,22 +33,23 @@ def test_concurrent_acquire_each_task_executed_once(tmp_path: Path) -> None:
         st = stores[idx]
         consumer = f"consumer-{idx}"
         while not stop.is_set():
-            task = st.acquire(consumer, lease_seconds=60)
-            if task is None:
+            claimed = st.acquire(consumer, lease_seconds=60)
+            if claimed is None:
                 empty_rounds[idx] += 1
                 if sum(empty_rounds.values()) >= CONSUMERS * 3:
                     stop.set()
                 stop.wait(0.001)
                 continue
+            task, token = claimed
             with lock:
                 empty_rounds[idx] = 0
             logger.info(
-                "消费者 %s 领取到任务 %s（入队标识=%s, attempt=%s, 租约到期=%s）",
+                "消费者 %s 领取到任务 %s（入队标识=%s, attempt=%s, 租约到期=%s, 凭证=%s）",
                 consumer, task.id, task.idempotency_key, task.attempt,
-                task.lease_expires_at,
+                task.lease_expires_at, token[:8],
             )
             try:
-                st.complete(task.id, consumer, {"by": consumer},
+                st.complete(task.id, consumer, token, {"by": consumer},
                             expected_version=task.version)
                 with lock:
                     executed.append((task.id, consumer))
@@ -93,12 +94,13 @@ def test_concurrent_acquire_with_lease_expiry_takeover(tmp_path: Path) -> None:
 
     def slow_worker() -> None:
         st = TaskStore(str(db), default_lease_seconds=1)
-        t = st.acquire("slow", lease_seconds=1)
-        if t is not None:
+        claimed = st.acquire("slow", lease_seconds=1)
+        if claimed is not None:
+            t, token = claimed
             # 模拟卡顿超过租约；等 fast 完成接管后再尝试提交
             fast_acquired.wait(5)
             try:
-                st.complete(t.id, "slow", expected_version=t.version)
+                st.complete(t.id, "slow", token, expected_version=t.version)
                 outcome["slow"] = "succeeded"
             except TaskRejected as exc:
                 outcome["slow"] = f"rejected:{exc.reason.value}"
@@ -111,20 +113,20 @@ def test_concurrent_acquire_with_lease_expiry_takeover(tmp_path: Path) -> None:
         st = TaskStore(str(db), default_lease_seconds=10)
         time.sleep(0.2)  # 等 slow 先领取
         # 轮询直到 slow 的租约过期并被 fast 接管
+        claimed = None
         for _ in range(40):
-            t = st.acquire("fast", lease_seconds=10)
-            if t is not None:
+            claimed = st.acquire("fast", lease_seconds=10)
+            if claimed is not None:
                 break
             time.sleep(0.05)
-        else:
-            t = None
-        if t is not None:
+        if claimed is not None:
+            t, token = claimed
             assert t.lease_owner == "fast"
             log_task("fast 接管过期任务", t)
             fast_acquired.set()
             # 等持过期租约的 slow 提交被拒后，fast 再完成任务
             slow_done.wait(5)
-            st.complete(t.id, "fast", expected_version=t.version)
+            st.complete(t.id, "fast", token, expected_version=t.version)
             outcome["fast"] = "succeeded"
         st.close()
 

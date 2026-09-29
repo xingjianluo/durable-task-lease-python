@@ -2,20 +2,26 @@
 from .errors import (
     EnqueueOutcome,
     HeartbeatOutcome,
+    RecoverOutcome,
     ReleaseOutcome,
     RejectReason,
+    RunningLeaseState,
     TaskRejected,
 )
-from .models import Task, TaskStatus
+from .models import EventRecord, Page, Task, TaskStatus
 from .store import TaskStore
 
 __all__ = [
     "TaskStore",
     "Task",
     "TaskStatus",
+    "EventRecord",
+    "Page",
     "TaskRejected",
     "RejectReason",
     "EnqueueOutcome",
     "ReleaseOutcome",
     "HeartbeatOutcome",
+    "RecoverOutcome",
+    "RunningLeaseState",
 ]

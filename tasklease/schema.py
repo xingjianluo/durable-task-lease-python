@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import sqlite3
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # 新增列的顺序即从“无版本旧库”升级时需要补齐的列。
 # (列名, 列定义) —— 默认值保证旧数据可读且语义自洽。
@@ -25,6 +25,9 @@ _COLUMN_MIGRATIONS: list[tuple[str, str]] = [
     ("result", "TEXT"),
     ("created_at", "REAL NOT NULL DEFAULT 0.0"),
     ("updated_at", "REAL NOT NULL DEFAULT 0.0"),
+    # v3：每次领取发放的一次性执行凭证；归档时间。
+    ("lease_token", "TEXT"),
+    ("archived_at", "REAL"),
 ]
 
 _CREATE_TASKS = """
@@ -38,9 +41,11 @@ CREATE TABLE IF NOT EXISTS tasks (
     version INTEGER NOT NULL DEFAULT 0,
     lease_owner TEXT,
     lease_expires_at REAL,
+    lease_token TEXT,
     available_at REAL NOT NULL DEFAULT 0.0,
     last_error TEXT,
     result TEXT,
+    archived_at REAL,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL
 )
@@ -57,6 +62,7 @@ CREATE TABLE IF NOT EXISTS task_events (
     task_id TEXT NOT NULL,
     event TEXT NOT NULL,
     actor TEXT,
+    lease_token TEXT,
     from_status TEXT,
     to_status TEXT,
     version INTEGER NOT NULL,
@@ -64,6 +70,60 @@ CREATE TABLE IF NOT EXISTS task_events (
     created_at REAL NOT NULL
 )
 """
+
+# 归档表：列与主表一致，另加 archived_at；终结很久的任务搬到这里，
+# 主表保持精简，新任务的领取/提交不受归档过程影响。
+_CREATE_TASKS_ARCHIVE = """
+CREATE TABLE IF NOT EXISTS tasks_archive (
+    id TEXT PRIMARY KEY,
+    idempotency_key TEXT NOT NULL,
+    payload TEXT NOT NULL DEFAULT '{}',
+    status TEXT NOT NULL,
+    attempt INTEGER NOT NULL DEFAULT 0,
+    max_attempts INTEGER NOT NULL DEFAULT 1,
+    version INTEGER NOT NULL DEFAULT 0,
+    lease_owner TEXT,
+    lease_expires_at REAL,
+    lease_token TEXT,
+    available_at REAL NOT NULL DEFAULT 0.0,
+    last_error TEXT,
+    result TEXT,
+    archived_at REAL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+)
+"""
+
+_CREATE_ARCHIVE_KEY_INDEX = (
+    "CREATE UNIQUE INDEX IF NOT EXISTS ux_tasks_archive_idempotency_key "
+    "ON tasks_archive(idempotency_key) WHERE idempotency_key <> ''"
+)
+
+_CREATE_EVENTS_ARCHIVE = """
+CREATE TABLE IF NOT EXISTS task_events_archive (
+    id INTEGER PRIMARY KEY,
+    task_id TEXT NOT NULL,
+    event TEXT NOT NULL,
+    actor TEXT,
+    lease_token TEXT,
+    from_status TEXT,
+    to_status TEXT,
+    version INTEGER NOT NULL,
+    reason TEXT,
+    created_at REAL NOT NULL
+)
+"""
+_CREATE_EVENTS_ARCHIVE_INDEX = (
+    "CREATE INDEX IF NOT EXISTS ix_task_events_archive_task "
+    "ON task_events_archive(task_id, id)"
+)
+_CREATE_EVENTS_INDEX = (
+    "CREATE INDEX IF NOT EXISTS ix_task_events_task ON task_events(task_id, id)"
+)
+_CREATE_TASKS_STATUS_INDEX = (
+    "CREATE INDEX IF NOT EXISTS ix_tasks_status_updated "
+    "ON tasks(status, updated_at)"
+)
 
 
 def _column_names(conn: sqlite3.Connection, table: str) -> set[str]:
@@ -86,7 +146,13 @@ def initialize(conn: sqlite3.Connection) -> int:
         # 全新数据库：直接建立最新结构。
         conn.execute(_CREATE_TASKS)
         conn.execute(_CREATE_KEY_INDEX)
+        conn.execute(_CREATE_TASKS_STATUS_INDEX)
         conn.execute(_CREATE_EVENTS)
+        conn.execute(_CREATE_EVENTS_INDEX)
+        conn.execute(_CREATE_TASKS_ARCHIVE)
+        conn.execute(_CREATE_ARCHIVE_KEY_INDEX)
+        conn.execute(_CREATE_EVENTS_ARCHIVE)
+        conn.execute(_CREATE_EVENTS_ARCHIVE_INDEX)
         conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
         conn.commit()
         return SCHEMA_VERSION
@@ -98,7 +164,21 @@ def initialize(conn: sqlite3.Connection) -> int:
             conn.execute(f"ALTER TABLE tasks ADD COLUMN {name} {ddl}")
 
     conn.execute(_CREATE_KEY_INDEX)
+    conn.execute(_CREATE_TASKS_STATUS_INDEX)
+
+    # 事件表：旧库可能没有，也可能是缺 lease_token 列的旧版本。
+    has_events = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_events'"
+    ).fetchone() is not None
     conn.execute(_CREATE_EVENTS)
+    if "lease_token" not in _column_names(conn, "task_events"):
+        conn.execute("ALTER TABLE task_events ADD COLUMN lease_token TEXT")
+    conn.execute(_CREATE_EVENTS_INDEX)
+
+    conn.execute(_CREATE_TASKS_ARCHIVE)
+    conn.execute(_CREATE_ARCHIVE_KEY_INDEX)
+    conn.execute(_CREATE_EVENTS_ARCHIVE)
+    conn.execute(_CREATE_EVENTS_ARCHIVE_INDEX)
     conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
     conn.commit()
     return SCHEMA_VERSION

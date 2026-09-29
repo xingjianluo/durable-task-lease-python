@@ -42,6 +42,15 @@ def store(clock: FakeClock) -> TaskStore:
     st.close()
 
 
+def claim(
+    st: TaskStore, consumer: str, lease_seconds: float | None = None
+) -> tuple[object, str]:
+    """测试辅助：领取并断言成功，返回 (task, lease_token)。"""
+    claimed = st.acquire(consumer, lease_seconds=lease_seconds)
+    assert claimed is not None, f"消费者 {consumer} 未领取到任务"
+    return claimed
+
+
 # 单测日志：打印入队标识、租约信息与状态流转判定依据。
 logging.basicConfig(
     level=logging.INFO,

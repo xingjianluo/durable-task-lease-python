@@ -15,6 +15,7 @@ from tasklease import (
 from tasklease.models import Task
 
 from ._logutil import log_events, log_task
+from .conftest import claim
 
 
 def test_duplicate_enqueue_converges_to_same_task(store: TaskStore) -> None:
@@ -56,8 +57,7 @@ def test_no_duplicate_rows_under_concurrent_enqueue(tmp_path) -> None:
 def test_enqueue_rejected_while_executing(store: TaskStore, clock) -> None:
     task, _ = store.enqueue("running-key")
     log_task("入队后", task)
-    claimed = store.acquire("worker-A", lease_seconds=10)
-    assert claimed is not None
+    claimed, tok = claim(store, "worker-A", lease_seconds=10)
     log_task("被A领取", claimed)
 
     with pytest.raises(TaskRejected) as exc:
@@ -77,11 +77,11 @@ def test_enqueue_rejected_for_terminal_tasks(store: TaskStore) -> None:
     for terminal_action in ("succeed", "fail"):
         key = f"terminal-{terminal_action}"
         task, _ = store.enqueue(key, max_attempts=1)
-        claimed = store.acquire("w")
+        claimed, tok = claim(store, "w")
         if terminal_action == "succeed":
-            store.complete(claimed.id, "w")
+            store.complete(claimed.id, "w", tok)
         else:
-            store.fail(claimed.id, "w", "boom")
+            store.fail(claimed.id, "w", tok, "boom")
         log_task(f"终态({terminal_action})", store.get(task.id))
 
         with pytest.raises(TaskRejected) as exc:
@@ -90,22 +90,51 @@ def test_enqueue_rejected_for_terminal_tasks(store: TaskStore) -> None:
         assert store.get(task.id).is_terminal()
 
 
+def test_enqueue_rejected_for_corrupt_legacy_running(tmp_path) -> None:
+    """旧版本遗留的缺字段 RUNNING：重复入队被 lease_corrupt 拒绝并提示恢复。"""
+    import sqlite3
+
+    from tasklease import RunningLeaseState
+
+    db = tmp_path / "corrupt.db"
+    raw = sqlite3.connect(db)
+    raw.execute(
+        "CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT NOT NULL, "
+        "idempotency_key TEXT NOT NULL DEFAULT '')"
+    )
+    raw.execute(
+        "INSERT INTO tasks (id,status,idempotency_key) VALUES ('x','running','corrupt-k')"
+    )
+    raw.commit(); raw.close()
+
+    st = TaskStore(str(db))
+    assert st.classify_running("x") is RunningLeaseState.CORRUPT
+    with pytest.raises(TaskRejected) as exc:
+        st.enqueue("corrupt-k")
+    assert exc.value.reason is RejectReason.LEASE_CORRUPT
+    st.close()
+
+
 def test_invalid_transitions_have_distinct_reasons(store: TaskStore) -> None:
     # 未领取（PENDING）直接完成 -> 非法流转，原因可区分
     task, _ = store.enqueue("k-pending")
     with pytest.raises(TaskRejected) as exc:
-        store.complete(task.id, "nobody")
+        store.complete(task.id, "nobody", "any-token")
     assert exc.value.reason is RejectReason.NOT_PENDING_OR_UNCLAIMED
 
-    claimed = store.acquire("owner")
+    claimed, tok = claim(store, "owner")
     # 非持有者
     with pytest.raises(TaskRejected) as exc:
-        store.complete(task.id, "intruder")
+        store.complete(task.id, "intruder", tok)
     assert exc.value.reason is RejectReason.LEASE_HELD_BY_OTHER
+    # 持有者但凭证错误
+    with pytest.raises(TaskRejected) as exc:
+        store.complete(task.id, "owner", "forged-token")
+    assert exc.value.reason is RejectReason.INVALID_TOKEN
 
     # 不存在的任务
     with pytest.raises(TaskRejected) as exc:
-        store.complete("missing", "owner")
+        store.complete("missing", "owner", "t")
     assert exc.value.reason is RejectReason.TASK_NOT_FOUND
 
 

@@ -8,26 +8,28 @@ import pytest
 from tasklease import RejectReason, TaskRejected, TaskStatus, TaskStore
 
 from ._logutil import log_events, log_task
+from .conftest import claim
 
 
 def test_retryable_failure_requeues_with_backoff(store, clock) -> None:
     task, _ = store.enqueue("retry-1", max_attempts=3)
-    claimed = store.acquire("w", lease_seconds=100)
-    assert claimed is not None and claimed.attempt == 1
+    claimed, tok = claim(store, "w", lease_seconds=100)
+    assert claimed.attempt == 1
 
-    failed = store.fail(task.id, "w", "transient", backoff_seconds=30)
+    failed = store.fail(task.id, "w", tok, "transient", backoff_seconds=30)
     assert failed.status is TaskStatus.PENDING
     assert failed.attempt == 1
     assert failed.available_at == pytest.approx(clock.now + 30)
-    assert failed.lease_owner is None
+    assert failed.lease_owner is None and failed.lease_token is None
     log_task("可重试失败，退避30s", failed)
 
     # 退避窗口内不可领取
     clock.advance(29)
     assert store.acquire("w2") is None
     clock.advance(2)  # 越过退避点
-    reclaimed = store.acquire("w2")
-    assert reclaimed is not None and reclaimed.attempt == 2
+    reclaimed, tok2 = claim(store, "w2")
+    assert reclaimed.attempt == 2
+    assert tok2 != tok
     log_task("退避结束重新领取", reclaimed)
     log_events(store._conn, task.id)  # type: ignore[attr-defined]
 
@@ -35,23 +37,23 @@ def test_retryable_failure_requeues_with_backoff(store, clock) -> None:
 def test_exponential_backoff_default(store, clock) -> None:
     # backoff_base=1.0：默认退避为 1 * 2**(attempt-1)
     task, _ = store.enqueue("retry-bo", max_attempts=5)
-    t1 = store.acquire("w", lease_seconds=100)
-    f1 = store.fail(task.id, "w", "e")  # attempt=1 -> 1s
+    t1, tok = claim(store, "w", lease_seconds=100)
+    f1 = store.fail(task.id, "w", tok, "e")  # attempt=1 -> 1s
     assert f1.available_at == pytest.approx(clock.now + 1.0)
     clock.advance(1.0)
-    t2 = store.acquire("w", lease_seconds=100)
-    f2 = store.fail(task.id, "w", "e")  # attempt=2 -> 2s
+    t2, tok = claim(store, "w", lease_seconds=100)
+    f2 = store.fail(task.id, "w", tok, "e")  # attempt=2 -> 2s
     assert f2.available_at == pytest.approx(clock.now + 2.0)
 
 
-def test_retry_exhaustion_enters_terminal(store, clock) -> None:
+def test_retry_exhaustion_enters_terminal(store) -> None:
     task, _ = store.enqueue("retry-max", max_attempts=2)
-    t1 = store.acquire("w", lease_seconds=100)
-    f1 = store.fail(task.id, "w", "e1", backoff_seconds=0)
+    t1, tok1 = claim(store, "w", lease_seconds=100)
+    f1 = store.fail(task.id, "w", tok1, "e1", backoff_seconds=0)
     assert f1.status is TaskStatus.PENDING
-    t2 = store.acquire("w", lease_seconds=100)
+    t2, tok2 = claim(store, "w", lease_seconds=100)
     assert t2.attempt == 2
-    f2 = store.fail(task.id, "w", "e2")
+    f2 = store.fail(task.id, "w", tok2, "e2")
     assert f2.status is TaskStatus.FAILED
     assert f2.is_terminal()
     log_task("重试耗尽进入终态", f2)
@@ -60,54 +62,53 @@ def test_retry_exhaustion_enters_terminal(store, clock) -> None:
     assert store.acquire("w") is None
     # 终态提交被拒
     with pytest.raises(TaskRejected) as exc:
-        store.complete(task.id, "w")
+        store.complete(task.id, "w", tok2)
     assert exc.value.reason is RejectReason.TASK_TERMINAL
 
 
 def test_succeeded_terminal_not_acquired(store) -> None:
     task, _ = store.enqueue("done-1")
-    claimed = store.acquire("w")
-    done = store.complete(claimed.id, "w", {"ok": True})
+    claimed, tok = claim(store, "w")
+    done = store.complete(claimed.id, "w", tok, {"ok": True})
     assert done.status is TaskStatus.SUCCEEDED
     assert store.acquire("w") is None
 
 
 def test_stale_version_write_rejected(store, clock) -> None:
     task, _ = store.enqueue("ver-1")
-    t1 = store.acquire("c1", lease_seconds=10)
+    t1, tok1 = claim(store, "c1", lease_seconds=10)
     # 另一消费者等租约过期后接管，版本被推进
     clock.advance(11)
-    t2 = store.acquire("c2", lease_seconds=10)
+    t2, tok2 = claim(store, "c2", lease_seconds=10)
     assert t2.version > t1.version
 
-    # c1 拿着旧版本尝试完成 -> 版本冲突，而不是静默生效
+    # c1 拿着旧版本尝试完成 -> 持有者已换人，先判定租约归属
     with pytest.raises(TaskRejected) as exc:
-        store.complete(task.id, "c1", result={"x": 1}, expected_version=t1.version)
-    assert exc.value.reason is RejectReason.LEASE_HELD_BY_OTHER  # 先判定租约归属
+        store.complete(task.id, "c1", tok1, result={"x": 1}, expected_version=t1.version)
+    assert exc.value.reason is RejectReason.LEASE_HELD_BY_OTHER
 
     # 持有者用过期版本提交 -> 明确的版本冲突拒绝
     clock.advance(11)
-    t3 = store.acquire("c3", lease_seconds=10)
-    # 模拟客户端基于 t2 的版本写回
+    t3, tok3 = claim(store, "c3", lease_seconds=10)
     with pytest.raises(TaskRejected) as exc:
-        store.complete(task.id, "c3", expected_version=t2.version)
+        store.complete(task.id, "c3", tok3, expected_version=t2.version)
     assert exc.value.reason is RejectReason.VERSION_CONFLICT
 
     # 基于当前版本写入成功
-    ok = store.complete(task.id, "c3", expected_version=t3.version)
+    ok = store.complete(task.id, "c3", tok3, expected_version=t3.version)
     assert ok.status is TaskStatus.SUCCEEDED
     log_task("版本对齐后写入成功", ok)
     log_events(store._conn, task.id)  # type: ignore[attr-defined]
 
 
-def test_concurrent_overwrite_prevented(store, clock) -> None:
+def test_concurrent_overwrite_prevented(store) -> None:
     # 同一次领取后，版本只能被成功消费一次：重复的条件更新 rowcount=0
     task, _ = store.enqueue("ver-2")
-    claimed = store.acquire("c1", lease_seconds=10)
-    ok = store.complete(task.id, "c1", expected_version=claimed.version)
+    claimed, tok = claim(store, "c1", lease_seconds=10)
+    ok = store.complete(task.id, "c1", tok, expected_version=claimed.version)
     assert ok.version == claimed.version + 1
     with pytest.raises(TaskRejected) as exc:
-        store.complete(task.id, "c1", expected_version=claimed.version)
+        store.complete(task.id, "c1", tok, expected_version=claimed.version)
     assert exc.value.reason is RejectReason.TASK_TERMINAL
 
 
@@ -126,12 +127,13 @@ def test_legacy_database_upgrades_and_stays_readable(tmp_path) -> None:
     assert upgraded.idempotency_key == ""
     assert upgraded.payload == {}
     assert upgraded.attempt == 0 and upgraded.version == 0
+    assert upgraded.lease_token is None
     log_task("旧数据升级后可读", upgraded)
 
-    # 旧数据参与正常生命周期
-    claim = st.acquire("legacy-worker")
-    assert claim is not None and claim.id == "legacy-1"
-    done = st.complete("legacy-1", "legacy-worker", expected_version=claim.version)
+    # 旧数据参与正常生命周期（领取后发放全新凭证）
+    claim_row, tok = claim(st, "legacy-worker")
+    assert claim_row.id == "legacy-1" and tok
+    done = st.complete("legacy-1", "legacy-worker", tok, expected_version=claim_row.version)
     assert done.status is TaskStatus.SUCCEEDED
     st.close()
 

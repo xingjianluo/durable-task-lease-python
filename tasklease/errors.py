@@ -9,27 +9,34 @@ class RejectReason(enum.Enum):
 
     TASK_EXECUTING = "task_executing"
     TASK_TERMINAL = "task_terminal"
+    TASK_QUARANTINED = "task_quarantined"
     LEASE_HELD_BY_OTHER = "lease_held_by_other"
     LEASE_EXPIRED = "lease_expired"
+    LEASE_CORRUPT = "lease_corrupt"
+    INVALID_TOKEN = "invalid_token"
     VERSION_CONFLICT = "version_conflict"
     TASK_NOT_FOUND = "task_not_found"
     NOT_PENDING_OR_UNCLAIMED = "not_pending_or_unclaimed"
 
 
 class ReleaseOutcome(enum.Enum):
-    """释放租约的结果（三类可区分）。"""
+    """释放租约的结果（可区分）。"""
 
     RELEASED = "released"
     NOT_HELD = "not_held"
     ALREADY_EXPIRED = "already_expired"
+    INVALID_TOKEN = "invalid_token"
+    CORRUPT = "corrupt"
 
 
 class HeartbeatOutcome(enum.Enum):
-    """租约续期的结果（三类可区分）。"""
+    """租约续期的结果（可区分）。"""
 
     RENEWED = "renewed"
     NOT_HELD = "not_held"
     EXPIRED = "expired"
+    INVALID_TOKEN = "invalid_token"
+    CORRUPT = "corrupt"
 
 
 class EnqueueOutcome(enum.Enum):
@@ -37,6 +44,23 @@ class EnqueueOutcome(enum.Enum):
 
     CREATED = "created"
     EXISTING = "existing"
+
+
+class RunningLeaseState(enum.Enum):
+    """RUNNING 任务租约健康度的三分类（运维判定用）。"""
+
+    ACTIVE = "active"
+    EXPIRED = "expired"
+    CORRUPT = "corrupt"
+
+
+class RecoverOutcome(enum.Enum):
+    """单条异常 RUNNING 任务的恢复结果。"""
+
+    REQUEUED = "requeued"
+    QUARANTINED = "quarantined"
+    SKIPPED_ACTIVE = "skipped_active"
+    SKIPPED_NOT_STUCK = "skipped_not_stuck"
 
 
 class TaskRejected(Exception):
