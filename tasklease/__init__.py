@@ -2,12 +2,28 @@
 from .errors import (
     EnqueueOutcome,
     HeartbeatOutcome,
+    LeaseHealth,
+    RecoveryAction,
+    RecoveryResult,
     ReleaseOutcome,
     RejectReason,
     TaskRejected,
 )
-from .models import Task, TaskStatus
-from .store import TaskStore
+from .models import (
+    ARCHIVABLE_TERMINAL_STATUSES,
+    LeaseGrant,
+    Page,
+    ResultView,
+    Task,
+    TaskEvent,
+    TaskStatus,
+)
+from .store import (
+    ArchiveReport,
+    RecoveryItem,
+    RecoveryReport,
+    TaskStore,
+)
 
 __all__ = [
     "TaskStore",
@@ -18,4 +34,15 @@ __all__ = [
     "EnqueueOutcome",
     "ReleaseOutcome",
     "HeartbeatOutcome",
+    "LeaseGrant",
+    "TaskEvent",
+    "ResultView",
+    "Page",
+    "ArchiveReport",
+    "RecoveryAction",
+    "RecoveryResult",
+    "RecoveryReport",
+    "RecoveryItem",
+    "LeaseHealth",
+    "ARCHIVABLE_TERMINAL_STATUSES",
 ]
